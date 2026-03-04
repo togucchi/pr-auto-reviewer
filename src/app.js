@@ -7,11 +7,14 @@ import { enqueue } from './services/claude-runner.js';
 import Header from './components/header.js';
 import PRList from './components/pr-list.js';
 import LogPanel from './components/log-panel.js';
+import ClaudeOutputPanel from './components/claude-output-panel.js';
 
-const { createElement: h, useState, useEffect, useCallback } = React;
+const { createElement: h, useState, useEffect, useCallback, useRef } = React;
 
 export default function App() {
   const { exit } = useApp();
+  const isInitialPoll = useRef(true);
+  const [selectedIndex, setSelectedIndex] = useState(0);
   const [state, setState] = useState({
     prs: store.getPRs(),
     logs: store.logs,
@@ -20,11 +23,16 @@ export default function App() {
   });
 
   const syncState = useCallback(() => {
+    const prs = store.getPRs();
+    // Find the currently reviewing PR to show its Claude output
+    const reviewingPR = prs.find((p) => p.status === 'reviewing');
     setState({
-      prs: store.getPRs(),
+      prs,
       logs: [...store.logs],
       isPolling: store.isPolling,
       lastPollTime: store.lastPollTime,
+      claudeOutput: reviewingPR ? store.getClaudeOutput(reviewingPR.url) : [],
+      claudeOutputLabel: reviewingPR ? `${reviewingPR.repo}#${reviewingPR.number}` : null,
     });
   }, []);
 
@@ -34,8 +42,12 @@ export default function App() {
   }, [syncState]);
 
   const doPoll = useCallback(async () => {
+    const initial = isInitialPoll.current;
     const before = new Set(store.prs.keys());
-    await poll();
+    if (initial) {
+      isInitialPoll.current = false;
+    }
+    await poll(initial ? 'pending' : 'queued');
     for (const [url, pr] of store.prs) {
       if (!before.has(url) && pr.status === 'queued') {
         enqueue(pr);
@@ -49,7 +61,7 @@ export default function App() {
     return () => clearInterval(timer);
   }, [doPoll]);
 
-  useInput((input) => {
+  useInput((input, key) => {
     if (input === 'q') {
       exit();
     } else if (input === 'r') {
@@ -63,6 +75,19 @@ export default function App() {
       if (failed.length > 0) {
         store.addLog(`Retrying ${failed.length} failed review(s)`);
       }
+    } else if (key.upArrow) {
+      setSelectedIndex((prev) => Math.max(0, prev - 1));
+    } else if (key.downArrow) {
+      const prs = store.getPRs();
+      setSelectedIndex((prev) => Math.min(prs.length - 1, prev + 1));
+    } else if (key.return) {
+      const prs = store.getPRs();
+      const pr = prs[selectedIndex];
+      if (pr && (pr.status === 'pending' || pr.status === 'failed' || pr.status === 'completed')) {
+        store.resetPR(pr.url);
+        enqueue(pr);
+        store.addLog(`Manual review started: ${pr.repo}#${pr.number}`);
+      }
     }
   });
 
@@ -74,7 +99,8 @@ export default function App() {
       lastPollTime: state.lastPollTime,
       pollInterval: POLL_INTERVAL_MS,
     }),
-    h(PRList, { prs: state.prs }),
+    h(PRList, { prs: state.prs, selectedIndex }),
+    h(ClaudeOutputPanel, { lines: state.claudeOutput || [], prLabel: state.claudeOutputLabel }),
     h(LogPanel, { logs: state.logs }),
     h(
       Box,
@@ -82,7 +108,7 @@ export default function App() {
       h(
         Text,
         { dimColor: true },
-        '[q] quit  [r] refresh now  [space] retry failed',
+        '[q] quit  [r] refresh now  [space] retry failed  [↑↓] select  [enter] review',
       ),
     ),
   );

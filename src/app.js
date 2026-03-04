@@ -1,4 +1,5 @@
 import React from 'react';
+import { execFile } from 'child_process';
 import { Box, Text, useApp, useInput } from 'ink';
 import { POLL_INTERVAL_MS } from './config.js';
 import store from './store.js';
@@ -80,6 +81,15 @@ export default function App() {
     } else if (key.downArrow) {
       const prs = store.getPRs();
       setSelectedIndex((prev) => Math.min(prs.length - 1, prev + 1));
+    } else if (input === 'o') {
+      const prs = store.getPRs();
+      const pr = prs[selectedIndex];
+      if (pr && pr.status === 'completed' && pr.reportPath) {
+        execFile('open', [pr.reportPath]);
+        store.addLog(`Opening report: ${pr.repo}#${pr.number}`);
+      } else {
+        store.addLog('レポートがありません');
+      }
     } else if (key.return) {
       const prs = store.getPRs();
       const pr = prs[selectedIndex];
@@ -108,7 +118,7 @@ export default function App() {
       h(
         Text,
         { dimColor: true },
-        '[q] quit  [r] refresh now  [space] retry failed  [↑↓] select  [enter] review',
+        '[q] quit  [r] refresh now  [space] retry failed  [↑↓] select  [enter] review  [o] open report',
       ),
     ),
   );

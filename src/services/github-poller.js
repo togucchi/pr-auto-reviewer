@@ -11,7 +11,7 @@ function getUser() {
   return currentUser;
 }
 
-export async function poll() {
+export async function poll(status = 'queued') {
   store.setPolling(true);
   store.addLog('Polling for review requests...');
 
@@ -40,7 +40,7 @@ export async function poll() {
         repo,
         number: item.number,
         title: item.title,
-      });
+      }, status);
       if (added) newCount++;
     }
 

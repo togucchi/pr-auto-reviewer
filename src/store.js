@@ -2,12 +2,18 @@ import { EventEmitter } from 'events';
 import fs from 'fs';
 import { MAX_LOG_ENTRIES, REVIEWED_PRS_PATH } from './config.js';
 
+const MAX_CLAUDE_OUTPUT_LINES = 50;
+const CLAUDE_OUTPUT_THROTTLE_MS = 500;
+
 class Store extends EventEmitter {
   constructor() {
     super();
     this.prs = new Map();
     this.reviewedUrls = new Set();
     this.logs = [];
+    this.claudeOutput = new Map(); // url -> string[]
+    this._claudeOutputDirty = false;
+    this._claudeOutputTimer = null;
     this.lastPollTime = null;
     this.isPolling = false;
     this._loadReviewed();
@@ -35,20 +41,20 @@ class Store extends EventEmitter {
     return this.reviewedUrls.has(url);
   }
 
-  addPR(pr) {
+  addPR(pr, status = 'queued') {
     if (this.prs.has(pr.url)) return false;
-    if (this.reviewedUrls.has(pr.url)) return false;
+    const isReviewed = this.reviewedUrls.has(pr.url);
     this.prs.set(pr.url, {
       url: pr.url,
       repo: pr.repo,
       number: pr.number,
       title: pr.title,
-      status: 'queued',
+      status: isReviewed ? 'completed' : status,
       reportPath: null,
       error: null,
     });
     this.emit('change');
-    return true;
+    return !isReviewed;
   }
 
   updatePR(url, updates) {
@@ -72,7 +78,7 @@ class Store extends EventEmitter {
 
   resetPR(url) {
     const pr = this.prs.get(url);
-    if (!pr || pr.status !== 'failed') return;
+    if (!pr || pr.status === 'queued' || pr.status === 'reviewing') return;
     pr.status = 'queued';
     pr.error = null;
     pr.reportPath = null;
@@ -86,6 +92,47 @@ class Store extends EventEmitter {
       this.logs = this.logs.slice(-MAX_LOG_ENTRIES);
     }
     this.emit('change');
+  }
+
+  addClaudeOutput(url, line) {
+    if (!this.claudeOutput.has(url)) {
+      this.claudeOutput.set(url, []);
+    }
+    const lines = this.claudeOutput.get(url);
+    lines.push(line);
+    if (lines.length > MAX_CLAUDE_OUTPUT_LINES) {
+      lines.splice(0, lines.length - MAX_CLAUDE_OUTPUT_LINES);
+    }
+    // Throttle re-renders for claude output
+    this._claudeOutputDirty = true;
+    if (!this._claudeOutputTimer) {
+      this._claudeOutputTimer = setTimeout(() => {
+        this._claudeOutputTimer = null;
+        if (this._claudeOutputDirty) {
+          this._claudeOutputDirty = false;
+          this.emit('change');
+        }
+      }, CLAUDE_OUTPUT_THROTTLE_MS);
+    }
+  }
+
+  flushClaudeOutput() {
+    if (this._claudeOutputTimer) {
+      clearTimeout(this._claudeOutputTimer);
+      this._claudeOutputTimer = null;
+    }
+    if (this._claudeOutputDirty) {
+      this._claudeOutputDirty = false;
+      this.emit('change');
+    }
+  }
+
+  getClaudeOutput(url) {
+    return this.claudeOutput.get(url) || [];
+  }
+
+  clearClaudeOutput(url) {
+    this.claudeOutput.delete(url);
   }
 
   setPolling(isPolling) {

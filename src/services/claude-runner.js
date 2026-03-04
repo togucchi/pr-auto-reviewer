@@ -1,9 +1,24 @@
-import { spawn } from 'child_process';
+import { spawn, execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { MAX_CONCURRENT_REVIEWS, CLAUDE_TIMEOUT_MS, REVIEW_REPORTS_DIR, PROJECT_ROOT } from '../config.js';
 import store from '../store.js';
 import { notifyComplete, notifyFailed } from './notifier.js';
+
+// Resolve claude binary absolute path at module load
+let claudeBin;
+try {
+  claudeBin = execFileSync('which', ['claude'], { encoding: 'utf-8' }).trim();
+} catch {
+  throw new Error('claude CLI not found in PATH');
+}
+
+// Log resolved binary info
+const claudeVersion = execFileSync(claudeBin, ['--version'], {
+  encoding: 'utf-8',
+  stdio: ['ignore', 'pipe', 'pipe'],
+}).trim();
+console.log(`[claude-runner] binary: ${claudeBin} (${claudeVersion})`);
 
 let running = 0;
 const queue = [];
@@ -45,9 +60,20 @@ function runReview(pr) {
 
   const beforeReports = getExistingReports();
 
+  // Verify claude version before each review
+  try {
+    const ver = execFileSync(claudeBin, ['--version'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+    store.addLog(`[claude-runner] Using: ${claudeBin} (${ver})`);
+  } catch (e) {
+    store.addLog(`[claude-runner] WARNING: version check failed: ${e.message}`);
+  }
+
   const prompt = `PRレビューレポートスキルを使って ${pr.url} のレビューレポートを作成して。レポートは ./review-reports/ に保存して。確認不要でそのまま保存してください。`;
 
-  const child = spawn('claude', ['--print', '-p', prompt], {
+  const child = spawn(claudeBin, ['--print', '-p', prompt], {
     cwd: PROJECT_ROOT,
     stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...process.env },

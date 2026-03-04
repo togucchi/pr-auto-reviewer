@@ -18,10 +18,63 @@ const claudeVersion = execFileSync(claudeBin, ['--version'], {
   encoding: 'utf-8',
   stdio: ['ignore', 'pipe', 'pipe'],
 }).trim();
-console.log(`[claude-runner] binary: ${claudeBin} (${claudeVersion})`);
+// Logged via store.addLog after Ink mounts (console.log breaks Ink rendering)
+const claudeBinInfo = `[claude-runner] binary: ${claudeBin} (${claudeVersion})`;
 
 let running = 0;
 const queue = [];
+
+function formatStreamEvent(event) {
+  // Init event
+  if (event.type === 'system' && event.subtype === 'init') {
+    return `ℹ Session started (${event.model || 'unknown'})`;
+  }
+
+  // Assistant message — extract tool use and text
+  if (event.type === 'assistant' && event.message?.content) {
+    const parts = [];
+    for (const block of event.message.content) {
+      if (block.type === 'tool_use') {
+        const input = block.input || {};
+        let detail = '';
+        if (block.name === 'Read' && input.file_path) {
+          detail = `: ${path.basename(input.file_path)}`;
+        } else if (block.name === 'Write' && input.file_path) {
+          detail = `: ${path.basename(input.file_path)}`;
+        } else if (block.name === 'Edit' && input.file_path) {
+          detail = `: ${path.basename(input.file_path)}`;
+        } else if (block.name === 'Bash' && input.command) {
+          detail = `: ${input.command.slice(0, 60)}`;
+        } else if (block.name === 'Glob' && input.pattern) {
+          detail = `: ${input.pattern}`;
+        } else if (block.name === 'Grep' && input.pattern) {
+          detail = `: ${input.pattern}`;
+        }
+        parts.push(`⚡ ${block.name}${detail}`);
+      } else if (block.type === 'text' && block.text) {
+        const trimmed = block.text.trim();
+        if (trimmed.length > 0) {
+          parts.push(trimmed.length > 80 ? trimmed.slice(0, 80) + '…' : trimmed);
+        }
+      }
+    }
+    return parts.length > 0 ? parts.join(' | ') : null;
+  }
+
+  // Tool result
+  if (event.type === 'tool_result') {
+    return null; // skip verbose tool results
+  }
+
+  // Result event (final)
+  if (event.type === 'result') {
+    const cost = event.total_cost_usd != null ? ` ($${event.total_cost_usd.toFixed(4)})` : '';
+    const turns = event.num_turns ? ` ${event.num_turns} turns` : '';
+    return `✓ Complete${turns}${cost}`;
+  }
+
+  return null;
+}
 
 function getExistingReports() {
   try {
@@ -48,7 +101,12 @@ function processQueue() {
   }
 }
 
+let logged = false;
 export function enqueue(pr) {
+  if (!logged) {
+    logged = true;
+    store.addLog(claudeBinInfo);
+  }
   queue.push(pr);
   processQueue();
 }
@@ -73,28 +131,74 @@ function runReview(pr) {
 
   const prompt = `PRレビューレポートスキルを使って ${pr.url} のレビューレポートを作成して。レポートは ./review-reports/ に保存して。確認不要でそのまま保存してください。`;
 
-  const child = spawn(claudeBin, ['--print', '-p', prompt], {
+  const child = spawn(claudeBin, [
+    '-p', prompt,
+    '--output-format', 'stream-json',
+    '--verbose',
+  ], {
     cwd: PROJECT_ROOT,
     stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...process.env },
+    detached: true,
   });
 
-  let stdout = '';
   let stderr = '';
-  child.stdout.on('data', (d) => (stdout += d));
+  let stdoutBuffer = '';
+  child.stdout.on('data', (d) => {
+    stdoutBuffer += d;
+    const lines = stdoutBuffer.split('\n');
+    stdoutBuffer = lines.pop(); // keep incomplete line in buffer
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const event = JSON.parse(line);
+        const display = formatStreamEvent(event);
+        if (display) {
+          store.addClaudeOutput(pr.url, display);
+        }
+      } catch {
+        // non-JSON line, show as-is
+        store.addClaudeOutput(pr.url, line);
+      }
+    }
+  });
   child.stderr.on('data', (d) => (stderr += d));
 
+  let timedOut = false;
+
   const timeout = setTimeout(() => {
-    child.kill('SIGTERM');
-    store.updatePR(pr.url, { status: 'failed', error: 'Timeout' });
-    store.addLog(`Review timeout: ${pr.repo}#${pr.number}`);
+    timedOut = true;
+    store.addLog(`Review timeout: ${pr.repo}#${pr.number} — sending SIGTERM`);
+
+    // Kill the entire process group to include child processes
+    try {
+      process.kill(-child.pid, 'SIGTERM');
+    } catch {
+      child.kill('SIGTERM');
+    }
+
+    // Force kill after 5 seconds if SIGTERM didn't work
+    setTimeout(() => {
+      if (!child.killed) {
+        store.addLog(`Force killing review: ${pr.repo}#${pr.number}`);
+        try {
+          process.kill(-child.pid, 'SIGKILL');
+        } catch {
+          child.kill('SIGKILL');
+        }
+      }
+    }, 5_000);
   }, CLAUDE_TIMEOUT_MS);
 
   child.on('close', (code) => {
     clearTimeout(timeout);
     running--;
+    store.flushClaudeOutput();
 
-    if (code === 0) {
+    if (timedOut) {
+      store.updatePR(pr.url, { status: 'failed', error: 'Timeout' });
+      notifyFailed(pr, 'Timeout');
+    } else if (code === 0) {
       const reportPath = findNewReport(beforeReports);
       store.updatePR(pr.url, { status: 'completed', reportPath });
       store.addLog(
